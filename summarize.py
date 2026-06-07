@@ -102,55 +102,82 @@ def chat(client, model, system, user):
     return resp.choices[0].message.content
 
 
+def _extract_video_id(url):
+    """从 YouTube URL 提取 video ID。"""
+    m = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})", url)
+    return m.group(1) if m else None
+
+
+def _fetch_title_ytdlp(url):
+    """用 yt-dlp 仅抓标题（不下载字幕），失败则返回空字符串。"""
+    try:
+        import yt_dlp
+        opts = {
+            "skip_download": True,
+            "quiet": True,
+            "no_warnings": True,
+            "nocheckcertificate": True,
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return (info or {}).get("title", "")
+    except Exception:
+        return ""
+
+
 def fetch_all_transcripts(url):
     """
-    用 yt-dlp 抓取字幕，返回:
+    用 youtube-transcript-api 抓取字幕，返回:
       transcripts: dict  { lang_key: text }
       title:       str
       orig_lang:   str   视频原始语言代码 (可能为 None)
     """
-    import yt_dlp
+    from youtube_transcript_api import YouTubeTranscriptApi
 
-    tmp = tempfile.mkdtemp(prefix="ytsum_")
-    outtmpl = os.path.join(tmp, "sub")
-    opts = {
-        "skip_download": True,
-        "writesubtitles": True,
-        "writeautomaticsub": True,
-        "subtitleslangs": ["zh-Hans", "zh-Hant", "zh", "en"],
-        "subtitlesformat": "vtt",
-        "outtmpl": outtmpl,
-        "quiet": True,
-        "no_warnings": True,
-        "ignoreerrors": True,
-    }
-    title = ""
+    video_id = _extract_video_id(url)
+    if not video_id:
+        return {}, "", None
+
+    title = _fetch_title_ytdlp(url)
     orig_lang = None
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        if info is None:
-            return {}, "", None
-        title = info.get("title", "")
-        orig_lang = info.get("language") or info.get("original_language")
-
-    vtts = glob.glob(os.path.join(tmp, "*.vtt"))
     transcripts = {}
-    for vtt_path in vtts:
-        fname = os.path.basename(vtt_path)
-        m = re.match(r"sub\.(.+)\.vtt$", fname)
-        if not m:
-            continue
-        lang_code = m.group(1)
-        if lang_code.startswith("zh"):
-            key = "zh"
-        elif lang_code.startswith("en"):
-            key = "en"
-        else:
-            key = lang_code
-        if key not in transcripts:
-            text = parse_vtt(vtt_path)
-            if text:
-                transcripts[key] = text
+    api = YouTubeTranscriptApi()
+
+    try:
+        transcript_list = api.list(video_id)
+    except Exception as e:
+        print(f"  字幕列表获取失败: {e}", file=sys.stderr)
+        return {}, title, None
+
+    prefer_langs = ["zh-Hans", "zh-Hant", "zh", "en"]
+
+    def _fetch_text(t):
+        data = t.fetch()
+        # FetchedTranscript 是可迭代对象，每个元素有 .text 属性
+        lines = []
+        for e in data:
+            text = e.text if hasattr(e, "text") else e.get("text", "")
+            if text.strip():
+                lines.append(text.strip())
+        return "\n".join(lines)
+
+    # 先尝试手动字幕，再尝试自动生成字幕
+    for manual in (True, False):
+        for lang in prefer_langs:
+            try:
+                if manual:
+                    t = transcript_list.find_manually_created_transcript([lang])
+                else:
+                    t = transcript_list.find_generated_transcript([lang])
+                key = "zh" if lang.startswith("zh") else "en"
+                if key not in transcripts:
+                    text = _fetch_text(t)
+                    if text:
+                        transcripts[key] = text
+                        if orig_lang is None:
+                            orig_lang = lang
+            except Exception:
+                pass
 
     return transcripts, title, orig_lang
 
