@@ -127,7 +127,7 @@ def _fetch_title_ytdlp(url, proxy=None):
         return ""
 
 
-def fetch_all_transcripts(url, proxy=None):
+def fetch_all_transcripts(url, proxy=None, webshare_user=None, webshare_pass=None):
     """
     用 youtube-transcript-api 抓取字幕，返回:
       transcripts: dict  { lang_key: text }
@@ -135,16 +135,29 @@ def fetch_all_transcripts(url, proxy=None):
       orig_lang:   str   视频原始语言代码 (可能为 None)
     """
     from youtube_transcript_api import YouTubeTranscriptApi
-    from youtube_transcript_api.proxies import GenericProxyConfig
+    from youtube_transcript_api.proxies import GenericProxyConfig, WebshareProxyConfig
 
     video_id = _extract_video_id(url)
     if not video_id:
         return {}, "", None
 
-    title = _fetch_title_ytdlp(url, proxy=proxy)
+    # 构建代理配置：Webshare 优先，其次通用代理
+    if webshare_user and webshare_pass:
+        proxy_config = WebshareProxyConfig(
+            proxy_username=webshare_user,
+            proxy_password=webshare_pass,
+        )
+        proxy_url = f"http://{webshare_user}-rotate:{webshare_pass}@p.webshare.io:80/"
+    elif proxy:
+        proxy_config = GenericProxyConfig(http_url=proxy, https_url=proxy)
+        proxy_url = proxy
+    else:
+        proxy_config = None
+        proxy_url = None
+
+    title = _fetch_title_ytdlp(url, proxy=proxy_url)
     orig_lang = None
     transcripts = {}
-    proxy_config = GenericProxyConfig(http_url=proxy, https_url=proxy) if proxy else None
     api = YouTubeTranscriptApi(proxy_config=proxy_config)
 
     try:
@@ -402,14 +415,17 @@ def main():
     ap.add_argument("-o", "--output", help="把完整输出保存到指定文件")
     ap.add_argument(
         "--proxy",
-        help="代理地址，用于绕过云端 IP 封锁。支持 HTTP/HTTPS/SOCKS5，例如:\n"
+        help="通用代理地址，支持 HTTP/HTTPS/SOCKS5，例如:\n"
              "  http://user:pass@host:port\n"
-             "  socks5://user:pass@host:port\n"
              "也可通过环境变量 HTTPS_PROXY 设置。",
     )
+    ap.add_argument("--webshare-user", help="Webshare 代理用户名（从 dashboard.webshare.io/proxy/settings 获取）")
+    ap.add_argument("--webshare-pass", help="Webshare 代理密码（从 dashboard.webshare.io/proxy/settings 获取）")
     args = ap.parse_args()
 
-    # 代理：优先用 --proxy 参数，其次读环境变量
+    # 代理：Webshare 优先，其次 --proxy，最后读环境变量
+    webshare_user = args.webshare_user or os.environ.get("WEBSHARE_PROXY_USER")
+    webshare_pass = args.webshare_pass or os.environ.get("WEBSHARE_PROXY_PASS")
     proxy = args.proxy or os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
 
     client = get_client()
@@ -417,12 +433,16 @@ def main():
     ai_translated = set()
 
     # ── 第一步: 抓字幕 ────────────────────────────────────────
-    if proxy:
+    if webshare_user and webshare_pass:
+        print(f"正在抓取字幕（使用 Webshare 代理）...", file=sys.stderr)
+    elif proxy:
         print(f"正在抓取字幕（使用代理: {proxy}）...", file=sys.stderr)
     else:
         print("正在抓取字幕...", file=sys.stderr)
     try:
-        transcripts, title, orig_lang = fetch_all_transcripts(args.url, proxy=proxy)
+        transcripts, title, orig_lang = fetch_all_transcripts(
+            args.url, proxy=proxy, webshare_user=webshare_user, webshare_pass=webshare_pass
+        )
     except Exception as e:
         sys.exit(f"字幕抓取失败: {e}")
 
