@@ -1,0 +1,15 @@
+# 输出文件
+output/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+
+# 临时字幕目录
+ytsum_*/
+
+# IDE
+.vscode/
+.idea/
