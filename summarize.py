@@ -9,7 +9,8 @@ YouTube 视频总结工具 (Groq API, 免费)
     python summarize.py <youtube_url> --lang en              # 仅英文总结
     python summarize.py <youtube_url> --lang both            # 中英对照总结 (默认)
     python summarize.py <youtube_url> --strategy bullet      # 直接分点（快）
-    python summarize.py <youtube_url> --strategy cod         # Chain-of-Density 迭代精炼（默认，质量更高）
+    python summarize.py <youtube_url> --strategy cod         # Chain-of-Density / 密度链 迭代精炼（默认，质量更高）
+    python summarize.py <youtube_url> --strategy outline     # 分章节大纲 + 分层抽象（长视频自动 Map-Reduce 分块）
     python summarize.py <youtube_url> --no-transcript        # 不附字幕原文
     python summarize.py <youtube_url> --model llama-3.1-8b-instant  # 换模型
     python summarize.py <youtube_url> -o out.txt             # 同时保存到文件
@@ -65,6 +66,38 @@ PROMPTS = {
         "3. Keep each bullet concise — one sentence\n"
         "4. Number of bullets matches the number of actual key points in the video\n"
         "5. Each bullet starts with •"
+    ),
+}
+
+# ── 分章节大纲 + 分层抽象 的最终格式化提示词 ──────────────────────
+# 在已得到「分章节要点」之后，整理成「一句话总览 → 核心要点 → 分章节详述」
+# 三层结构，让读者按需选择阅读粒度。
+OUTLINE_PROMPTS = {
+    "both": (
+        "请基于以下【分章节要点】整理成结构化总结。\n"
+        "先输出【中文总结】，再输出【English Summary】，两部分内容一一对应。\n"
+        "每部分内部都按如下三层结构输出：\n"
+        "1. **一句话总览（TL;DR）**：用一句完整、流畅的话概括整个视频\n"
+        "2. **核心要点**：3-6 条以 • 开头的要点，覆盖最重要的结论\n"
+        "3. **分章节详述**：按视频推进顺序划分若干章节，每章一个 ### 小标题，"
+        "标题下用 • 列出该章要点\n"
+        "要求：章节顺序符合视频逻辑，内容不重复、不遗漏关键信息，每条要点言简意赅。"
+    ),
+    "zh": (
+        "请基于以下【分章节要点】整理成结构化中文总结，按如下三层结构输出：\n"
+        "1. **一句话总览（TL;DR）**：用一句完整、流畅的话概括整个视频\n"
+        "2. **核心要点**：3-6 条以 • 开头的要点，覆盖最重要的结论\n"
+        "3. **分章节详述**：按视频推进顺序划分若干章节，每章一个 ### 小标题，"
+        "标题下用 • 列出该章要点\n"
+        "要求：章节顺序符合视频逻辑，内容不重复、不遗漏关键信息，每条要点言简意赅。"
+    ),
+    "en": (
+        "Based on the [chapter notes] below, produce a structured summary with this three-layer format:\n"
+        "1. **TL;DR**: one clean, complete sentence summarizing the whole video\n"
+        "2. **Key points**: 3-6 bullets (start each with •) covering the most important takeaways\n"
+        "3. **Chapter-by-chapter**: split into chapters following the video's flow; "
+        "each chapter gets a ### heading with • bullets underneath\n"
+        "Requirements: chapters follow the video's logic, no duplication, no missing key info, each bullet concise."
     ),
 }
 
@@ -241,12 +274,87 @@ def summarize_cod(client, model, transcript, title, lang, rounds=3):
     return chat(client, model, system_fmt, user_fmt)
 
 
+def chunk_transcript(text, max_chars=8000, overlap_lines=2):
+    """把长字幕按行切分成带少量重叠的块，避免割裂语义。
+
+    返回 list[str]；若文本不超长则返回单元素列表。
+    """
+    lines = text.splitlines()
+    chunks = []
+    cur = []
+    cur_len = 0
+    for line in lines:
+        # 当前块已满且非空 → 收口，并保留尾部几行作为重叠上下文
+        if cur_len + len(line) + 1 > max_chars and cur:
+            chunks.append("\n".join(cur))
+            cur = cur[-overlap_lines:] if overlap_lines else []
+            cur_len = sum(len(l) + 1 for l in cur)
+        cur.append(line)
+        cur_len += len(line) + 1
+    if cur:
+        chunks.append("\n".join(cur))
+    return chunks or [text]
+
+
+def summarize_outline(client, model, transcript, title, lang, max_chars=8000):
+    """分章节大纲 + 分层抽象 总结（长视频先 Map-Reduce 分块）。
+
+    流程：
+      Map    — 把超长字幕切块，逐块提炼该段的主题/章节要点
+      Reduce — 把各块要点汇总，交由模型整合成全局章节大纲并去重
+      分层抽象 — 输出「一句话总览(TL;DR) → 核心要点 → 分章节详述」三层结构
+    短视频（单块）跳过 Map-Reduce，直接进入分层抽象。
+    """
+    work_lang = "zh" if lang == "zh" else "en"
+    lang_label = "中文" if work_lang == "zh" else "English"
+
+    chunks = chunk_transcript(transcript, max_chars=max_chars)
+
+    # ── Map: 逐块提炼章节要点 ────────────────────────────────
+    if len(chunks) == 1:
+        chapter_notes = transcript
+    else:
+        print(f"  Outline: 长字幕分为 {len(chunks)} 块，开始 Map-Reduce", file=sys.stderr)
+        system = "你是专业视频内容分析师，擅长从字幕片段中提炼结构化要点。"
+        partials = []
+        for i, chunk in enumerate(chunks, 1):
+            user = (
+                f"以下是视频字幕的第 {i}/{len(chunks)} 段。"
+                f"请用{lang_label}提炼这一段涉及的主题/章节及其要点，"
+                f"以「主题 — 要点1；要点2；…」的形式分行列出，"
+                f"只输出要点，不要额外解释。\n\n{chunk}"
+            )
+            partials.append(chat(client, model, system, user))
+            print(f"  Outline Map {i}/{len(chunks)} 完成", file=sys.stderr)
+
+        # ── Reduce: 汇总各块要点，整合成全局章节大纲 ──────────
+        print("  Outline Reduce 整合章节大纲...", file=sys.stderr)
+        merged = "\n\n".join(f"[第{i}段]\n{p}" for i, p in enumerate(partials, 1))
+        user = (
+            f"以下是同一视频按时间顺序分段提炼出的要点（用{lang_label}）。"
+            f"请把它们合并、去重，整合成一份覆盖全片、逻辑连贯的【分章节要点】，"
+            f"按视频推进顺序组织，相邻重复的主题合并为一个章节，"
+            f"以「章节 — 要点1；要点2；…」分行列出，只输出整合结果。\n\n{merged}"
+        )
+        chapter_notes = chat(client, model, system, user)
+
+    # ── 分层抽象：套用 outline 提示词输出三层结构 ──────────────
+    print("  Outline 分层抽象输出...", file=sys.stderr)
+    system_fmt = "你是一个专业的视频内容总结助手。"
+    user_fmt = (
+        OUTLINE_PROMPTS[lang]
+        + f"\n\n视频标题: {title}\n\n分章节要点:\n{chapter_notes}"
+    )
+    return chat(client, model, system_fmt, user_fmt)
+
+
 # ── 策略注册表 ────────────────────────────────────────────────
 # 新增策略：实现同签名函数 fn(client, model, transcript, title, lang) -> str
 # 然后在此处注册即可。
 SUMMARIZE_STRATEGIES = {
-    "bullet": summarize_bullet,
-    "cod":    summarize_cod,
+    "bullet":  summarize_bullet,
+    "cod":     summarize_cod,
+    "outline": summarize_outline,
 }
 
 
@@ -277,7 +385,11 @@ def build_markdown(title, url, summary, transcripts, orig_lang, ai_translated, l
     lines += [f"# {title or 'YouTube 视频总结'}", ""]
     lines += [f"> 来源：{url}"]
     if strategy:
-        strategy_labels = {"bullet": "Bullet（直接分点）", "cod": "Chain-of-Density（迭代精炼）"}
+        strategy_labels = {
+            "bullet":  "Bullet（直接分点）",
+            "cod":     "Chain-of-Density / 密度链 CoD（迭代精炼）",
+            "outline": "分章节大纲 + 分层抽象（长视频 Map-Reduce）",
+        }
         lines += [f"> 总结策略：{strategy_labels.get(strategy, strategy)}"]
     lines += ["", "---", ""]
 
@@ -362,7 +474,8 @@ def main():
     )
     ap.add_argument(
         "--strategy", choices=list(SUMMARIZE_STRATEGIES.keys()), default=DEFAULT_STRATEGY,
-        help="总结策略：bullet=直接分点（快）, cod=Chain-of-Density迭代精炼（默认，质量更高）",
+        help="总结策略：bullet=直接分点（快）, cod=Chain-of-Density/密度链迭代精炼（默认，质量更高）, "
+             "outline=分章节大纲+分层抽象（长视频自动 Map-Reduce 分块）",
     )
     ap.add_argument(
         "--no-transcript", action="store_true",
@@ -386,7 +499,11 @@ def main():
     if not best:
         sys.exit("该视频没有可用字幕。可考虑安装 ffmpeg + Whisper 做语音转录。")
 
-    strategy_labels = {"bullet": "Bullet 分点", "cod": "Chain-of-Density"}
+    strategy_labels = {
+        "bullet":  "Bullet 分点",
+        "cod":     "Chain-of-Density / 密度链",
+        "outline": "分章节大纲 + 分层抽象",
+    }
     print(f"  抓到字幕 ({len(best)} 字)，正在总结（策略: {strategy_labels.get(args.strategy, args.strategy)}）...", file=sys.stderr)
 
     # ── 第二步: 总结 ──────────────────────────────────────────
