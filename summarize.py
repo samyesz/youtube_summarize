@@ -108,7 +108,7 @@ def _extract_video_id(url):
     return m.group(1) if m else None
 
 
-def _fetch_title_ytdlp(url):
+def _fetch_title_ytdlp(url, proxy=None):
     """用 yt-dlp 仅抓标题（不下载字幕），失败则返回空字符串。"""
     try:
         import yt_dlp
@@ -118,6 +118,8 @@ def _fetch_title_ytdlp(url):
             "no_warnings": True,
             "nocheckcertificate": True,
         }
+        if proxy:
+            opts["proxy"] = proxy
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
             return (info or {}).get("title", "")
@@ -125,7 +127,7 @@ def _fetch_title_ytdlp(url):
         return ""
 
 
-def fetch_all_transcripts(url):
+def fetch_all_transcripts(url, proxy=None):
     """
     用 youtube-transcript-api 抓取字幕，返回:
       transcripts: dict  { lang_key: text }
@@ -133,15 +135,17 @@ def fetch_all_transcripts(url):
       orig_lang:   str   视频原始语言代码 (可能为 None)
     """
     from youtube_transcript_api import YouTubeTranscriptApi
+    from youtube_transcript_api.proxies import GenericProxyConfig
 
     video_id = _extract_video_id(url)
     if not video_id:
         return {}, "", None
 
-    title = _fetch_title_ytdlp(url)
+    title = _fetch_title_ytdlp(url, proxy=proxy)
     orig_lang = None
     transcripts = {}
-    api = YouTubeTranscriptApi()
+    proxy_config = GenericProxyConfig(http_url=proxy, https_url=proxy) if proxy else None
+    api = YouTubeTranscriptApi(proxy_config=proxy_config)
 
     try:
         transcript_list = api.list(video_id)
@@ -396,16 +400,29 @@ def main():
         help="不附字幕原文，只输出总结",
     )
     ap.add_argument("-o", "--output", help="把完整输出保存到指定文件")
+    ap.add_argument(
+        "--proxy",
+        help="代理地址，用于绕过云端 IP 封锁。支持 HTTP/HTTPS/SOCKS5，例如:\n"
+             "  http://user:pass@host:port\n"
+             "  socks5://user:pass@host:port\n"
+             "也可通过环境变量 HTTPS_PROXY 设置。",
+    )
     args = ap.parse_args()
+
+    # 代理：优先用 --proxy 参数，其次读环境变量
+    proxy = args.proxy or os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
 
     client = get_client()
     model = args.model
     ai_translated = set()
 
     # ── 第一步: 抓字幕 ────────────────────────────────────────
-    print("正在抓取字幕...", file=sys.stderr)
+    if proxy:
+        print(f"正在抓取字幕（使用代理: {proxy}）...", file=sys.stderr)
+    else:
+        print("正在抓取字幕...", file=sys.stderr)
     try:
-        transcripts, title, orig_lang = fetch_all_transcripts(args.url)
+        transcripts, title, orig_lang = fetch_all_transcripts(args.url, proxy=proxy)
     except Exception as e:
         sys.exit(f"字幕抓取失败: {e}")
 
